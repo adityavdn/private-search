@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Private Search</title>
+<style>
+  :root { --bg:#fafaf9; --fg:#1c1917; --muted:#78716c; --card:#fff; --line:#e7e5e4; --accent:#2563eb; --mark:#fde68a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0c0a09; --fg:#f5f5f4; --muted:#a8a29e; --card:#1c1917; --line:#292524; --accent:#60a5fa; --mark:#854d0e; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.5 system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:760px; margin:0 auto; padding:48px 16px; }
+  h1 { margin:0; font-size:28px; letter-spacing:-.02em; }
+  .tag { color:var(--muted); margin:4px 0 24px; }
+  #q { width:100%; font-size:18px; padding:14px 16px; border:1px solid var(--line); border-radius:12px;
+       background:var(--card); color:var(--fg); outline:none; }
+  #q:focus { border-color:var(--accent); }
+  .bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:12px 0 24px; color:var(--muted); font-size:14px; }
+  .bar .grow { flex:1; }
+  button, label.btn { font:inherit; font-size:14px; padding:6px 12px; border:1px solid var(--line); border-radius:8px;
+       background:var(--card); color:var(--fg); cursor:pointer; }
+  button:hover, label.btn:hover { border-color:var(--accent); }
+  .result { padding:14px 16px; border:1px solid var(--line); border-radius:12px; background:var(--card); margin-bottom:10px; cursor:pointer; }
+  .result:hover { border-color:var(--accent); }
+  .name { font-weight:600; color:var(--accent); word-break:break-all; }
+  .meta { font-size:12px; color:var(--muted); }
+  .snip { margin-top:4px; font-size:14px; white-space:pre-wrap; word-break:break-word; }
+  mark { background:var(--mark); color:inherit; border-radius:3px; padding:0 1px; }
+  .empty { text-align:center; color:var(--muted); padding:48px 16px; border:2px dashed var(--line); border-radius:16px; }
+  #drop { position:fixed; inset:0; background:color-mix(in srgb, var(--accent) 15%, transparent); border:4px dashed var(--accent);
+          display:none; align-items:center; justify-content:center; font-size:24px; font-weight:600; z-index:5; }
+  body.dragging #drop { display:flex; }
+  dialog { width:min(900px, 100%); max-height:85vh; border:1px solid var(--line); border-radius:14px; background:var(--card); color:var(--fg); padding:0; }
+  dialog header { display:flex; justify-content:space-between; gap:8px; padding:12px 16px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--card); }
+  dialog pre { margin:0; padding:16px; white-space:pre-wrap; word-break:break-word; font:14px/1.6 ui-monospace, monospace; }
+  dialog::backdrop { background:rgb(0 0 0 / .4); }
+</style>
+</head>
+<body>
+<div id="drop">Drop files to add them</div>
+<main>
+  <h1>🔒 Private Search</h1>
+  <p class="tag">Search your own files. Everything stays in this browser: nothing is uploaded, nothing is tracked.</p>
+  <input id="q" type="search" placeholder="Search your files…  (press / to focus)" autocomplete="off" autofocus>
+  <div class="bar">
+    <label class="btn">Add files<input id="files" type="file" multiple hidden></label>
+    <label class="btn">Add folder<input id="folder" type="file" webkitdirectory hidden></label>
+    <button id="clear">Clear all</button>
+    <span class="grow"></span>
+    <span id="status"></span>
+  </div>
+  <div id="results"></div>
+</main>
+<dialog id="viewer"><header><strong id="vname"></strong><button onclick="viewer.close()">Close</button></header><pre id="vtext"></pre></dialog>
+
+<script>
+// ---------- storage: IndexedDB (stays on this device) ----------
+const db = new Promise((ok, fail) => {
+  const req = indexedDB.open("private-search", 1);
+  req.onupgradeneeded = () => req.result.createObjectStore("docs", { keyPath: "id" });
+  req.onsuccess = () => ok(req.result);
+  req.onerror = () => fail(req.error);
+});
+async function store(mode, fn) {
+  const tx = (await db).transaction("docs", mode);
+  const out = fn(tx.objectStore("docs"));
+  return new Promise((ok, fail) => { tx.oncomplete = () => ok(out.result); tx.onerror = () => fail(tx.error); });
+}
+
+// ---------- index: inverted index + BM25 ranking ----------
+const docs = new Map();      // id -> {id, name, size, text, len}
+const postings = new Map();  // term -> Map(id -> count)
+const tokenize = s => s.toLowerCase().match(/[\p{L}\p{N}]+/gu) || [];
+
+function addToIndex(doc) {
+  removeFromIndex(doc.id);
+  const terms = tokenize(doc.text);
+  doc.len = terms.length;
+  docs.set(doc.id, doc);
+  for (const t of terms) {
+    if (!postings.has(t)) postings.set(t, new Map());
+    const p = postings.get(t);
+    p.set(doc.id, (p.get(doc.id) || 0) + 1);
+  }
+}
+function removeFromIndex(id) {
+  if (!docs.has(id)) return;
+  for (const t of new Set(tokenize(docs.get(id).text))) {
+    postings.get(t)?.delete(id);
+    if (postings.get(t)?.size === 0) postings.delete(t);
+  }
+  docs.delete(id);
+}
+
+function search(query) {
+  const words = tokenize(query);
+  if (!words.length) return { hits: [], terms: [] };
+  // last word matches as a prefix, so results appear while you type
+  const last = words.pop();
+  const typing = !/\s$/.test(query);
+  let terms = [...words, last];
+  if (typing) {
+    const prefix = [...postings.keys()].filter(t => t.startsWith(last)).slice(0, 50); // ponytail: linear scan of vocabulary; use a sorted array + binary search past ~1M words
+    terms = [...words, ...(prefix.length ? prefix : [last])];
+  }
+  const N = docs.size, avg = [...docs.values()].reduce((a, d) => a + d.len, 0) / (N || 1);
+  const scores = new Map(), matched = new Map();
+  for (const t of new Set(terms)) {
+    const p = postings.get(t); if (!p) continue;
+    const idf = Math.log(1 + (N - p.size + 0.5) / (p.size + 0.5));
+    for (const [id, tf] of p) {
+      const len = docs.get(id).len;
+      scores.set(id, (scores.get(id) || 0) + idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * len / avg)));
+      matched.set(id, (matched.get(id) || new Set()).add(words.includes(t) ? t : (t.startsWith(last) ? last : t)));
+    }
+  }
+  // docs matching every query word rank above docs matching only some
+  const want = new Set([...words, last]).size;
+  const hits = [...scores].map(([id, s]) => ({ doc: docs.get(id), score: s + (matched.get(id).size >= want ? 1000 : 0) }))
+    .sort((a, b) => b.score - a.score).slice(0, 50);
+  return { hits, terms: [...words, last] };
+}
+
+// ---------- reading files ----------
+let pdfjs;
+async function readPdf(file) {
+  if (!pdfjs) {
+    await new Promise((ok, fail) => {
+      const s = document.createElement("script");
+      s.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+      s.onload = ok; s.onerror = fail; document.head.append(s);
+    });
+    pdfjs = window.pdfjsLib;
+    pdfjs.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  }
+  const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+  const pages = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const content = await (await pdf.getPage(i)).getTextContent();
+    pages.push(content.items.map(x => x.str).join(" "));
+  }
+  return pages.join("\n\n");
+}
+async function readFile(file) {
+  if (/\.pdf$/i.test(file.name)) return readPdf(file);
+  if (file.size > 20e6) return null;                  // skip huge files
+  const text = await file.text();
+  return text.includes("\u0000") ? null : text;       // skip images, zips and other binaries
+}
+
+async function addFiles(fileList) {
+  const files = [...fileList].filter(f => !f.name.startsWith("."));
+  let added = 0, skipped = 0;
+  for (const [i, f] of files.entries()) {
+    status(`Reading ${i + 1}/${files.length}: ${f.name}`);
+    try {
+      const text = await readFile(f);
+      if (!text || !text.trim()) { skipped++; continue; }
+      const doc = { id: (f.webkitRelativePath || f.name) + ":" + f.size, name: f.webkitRelativePath || f.name, size: f.size, text };
+      await store("readwrite", s => s.put(doc));
+      addToIndex(doc); added++;
+    } catch { skipped++; }
+  }
+  render();
+  status(`Added ${added} file${added === 1 ? "" : "s"}${skipped ? `, skipped ${skipped} (not text)` : ""} · ${docs.size} indexed`);
+}
+
+// ---------- UI ----------
+const $ = id => document.getElementById(id);
+const esc = s => s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const markRe = terms => new RegExp(`\\b(${terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`, "giu");
+const highlight = (text, terms) => esc(text).replace(markRe(terms), "<mark>$1</mark>");
+
+const status = msg => $("status").textContent = msg || `${docs.size} file${docs.size === 1 ? "" : "s"} indexed`;
+
+function snippet(text, terms) {
+  const m = markRe(terms).exec(text);
+  const start = Math.max(0, (m ? m.index : 0) - 80);
+  const cut = text.slice(start, start + 240).replace(/\s+/g, " ");
+  return (start ? "…" : "") + highlight(cut, terms) + (start + 240 < text.length ? "…" : "");
+}
+
+function render() {
+  const q = $("q").value;
+  history.replaceState(null, "", q ? "#" + encodeURIComponent(q) : location.pathname);
+  if (!docs.size) {
+    $("results").innerHTML = `<div class="empty"><b>Drop files anywhere on this page</b> or use <b>Add files</b> / <b>Add folder</b>.<br>
+      Works with notes, PDFs, CSV, JSON, Markdown, code and other text files.<br>They're saved in this browser only, so they'll still be here next time.</div>`;
+    return status();
+  }
+  if (!q.trim()) { $("results").innerHTML = ""; return status(); }
+  const t0 = performance.now();
+  const { hits, terms } = search(q);
+  $("status").textContent = `${hits.length} result${hits.length === 1 ? "" : "s"} in ${(performance.now() - t0).toFixed(1)} ms · ${docs.size} files`;
+  $("results").innerHTML = hits.length ? hits.map(({ doc }) => `
+    <div class="result" data-id="${esc(doc.id)}">
+      <div class="name">${esc(doc.name)}</div>
+      <div class="meta">${(doc.size / 1024).toFixed(1)} KB</div>
+      <div class="snip">${snippet(doc.text, terms)}</div>
+    </div>`).join("") : `<div class="empty">No matches for “${esc(q)}”.</div>`;
+}
+
+$("results").onclick = e => {
+  const el = e.target.closest(".result"); if (!el) return;
+  const doc = docs.get(el.dataset.id), terms = search($("q").value).terms;
+  $("vname").textContent = doc.name;
+  $("vtext").innerHTML = highlight(doc.text, terms);
+  $("viewer").showModal();
+  $("vtext").querySelector("mark")?.scrollIntoView({ block: "center" });
+};
+$("q").oninput = render;
+$("files").onchange = e => addFiles(e.target.files);
+$("folder").onchange = e => addFiles(e.target.files);
+$("clear").onclick = async () => {
+  if (!confirm(`Remove all ${docs.size} files from this browser?`)) return;
+  await store("readwrite", s => s.clear());
+  docs.clear(); postings.clear(); render();
+};
+document.onkeydown = e => { if (e.key === "/" && document.activeElement !== $("q")) { e.preventDefault(); $("q").focus(); } };
+let depth = 0;
+addEventListener("dragenter", e => { e.preventDefault(); depth++; document.body.classList.add("dragging"); });
+addEventListener("dragleave", () => { if (--depth === 0) document.body.classList.remove("dragging"); });
+addEventListener("dragover", e => e.preventDefault());
+addEventListener("drop", e => { e.preventDefault(); depth = 0; document.body.classList.remove("dragging"); addFiles(e.dataTransfer.files); });
+
+// load what was saved last time
+store("readonly", s => s.getAll()).then(all => {
+  all.forEach(addToIndex);
+  if (location.hash) $("q").value = decodeURIComponent(location.hash.slice(1));
+  render();
+});
+</script>
+</body>
+</html>
