@@ -1,12 +1,40 @@
-# 🔒 Private Search
+# Private Search
 
-A search engine for your own files that runs entirely in your browser.
+A browser-based private search engine for your own files, built to keep data local and searchable without uploading content anywhere.
 
-**Live:** https://adityavdn.github.io/private-search/
+## Overview
 
-- Drop in notes, PDFs, CSVs, JSON, Markdown, code or other text files and search across all of them instantly.
-- **Private:** your files are never uploaded. They're indexed and stored in your browser (IndexedDB) and stay there between visits.
-- Ranks results with **BM25** (the algorithm behind Elasticsearch and Lucene) using an inverted index built in the browser.
-- Search as you type, with highlighted snippets and a full-text viewer.
+Private Search is a client-side search tool for notes, PDFs, markdown files, CSVs, JSON and other text-based files. It indexes local files in the browser using IndexedDB and ranks results with BM25-style relevance scoring.
 
-It's a single `index.html` with no build step, no server and no dependencies. PDF text extraction uses pdf.js, which is loaded only when you add a PDF.
+## Why it matters
+
+- files stay in the browser
+- no server-side upload is required
+- search works quickly on local collections
+- results include snippets and a full-text viewer
+
+## Tech Stack
+
+- HTML
+- JavaScript
+- IndexedDB
+- PDF.js
+
+## How to run
+
+Open the app in a browser and add files from your local machine. The project is designed as a static front-end with no backend requirement.
+
+Live demo:
+
+- https://adityavdn.github.io/private-search/
+
+## Project structure
+
+```text
+.
+├── index.html
+├── app logic and UI files
+├── README.md
+└── assets or library files
+```
+
